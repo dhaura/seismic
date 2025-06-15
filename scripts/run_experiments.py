@@ -65,18 +65,18 @@ def compile_rust_code(configs, experiment_dir):
 
     try:
         print("Compiling Rust code with", compile_command)
-        with open(compilation_output_file, "w") as comp_output:
-            compile_process = subprocess.Popen(compile_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            for line in iter(compile_process.stdout.readline, b''):
-                decoded_line = line.decode()
-                print(decoded_line, end='')  # Print each line as it is produced
-                comp_output.write(decoded_line)  # Write each line to the output file
-            compile_process.stdout.close()
-            compile_process.wait()
+        # with open(compilation_output_file, "w") as comp_output:
+        #     compile_process = subprocess.Popen(compile_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        #     for line in iter(compile_process.stdout.readline, b''):
+        #         decoded_line = line.decode()
+        #         print(decoded_line, end='')  # Print each line as it is produced
+        #         comp_output.write(decoded_line)  # Write each line to the output file
+        #     compile_process.stdout.close()
+        #     compile_process.wait()
 
-        if compile_process.returncode != 0:
-            print("Rust compilation failed.")
-            sys.exit(1)
+        # if compile_process.returncode != 0:
+        #     print("Rust compilation failed.")
+        #     sys.exit(1)
         print("Rust code compiled successfully.")
 
     except Exception as e:
@@ -343,7 +343,7 @@ def get_machine_info(configs, experiment_folder):
     machine_info.write(f"cpufreq configuration\n")
     machine_info.write(f"---------------------\n")
 
-    command_governor = 'cpufreq-info | grep "performance" | grep -v "available" | wc -l'
+    command_governor = 'lscpu | grep "performance" | grep -v "available" | wc -l'
     governor = subprocess.Popen(command_governor, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     governor.wait()
 

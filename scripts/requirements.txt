@@ -4,6 +4,9 @@ ir_measures
 psutil
 pandas
 numpy
-itertools
 ranx
 pytrec_eval
+ir_measures
+toml
+psutil
+termcolor

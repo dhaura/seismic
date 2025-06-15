@@ -1,0 +1,12 @@
+Searching for top-10 results
+Number of evaluated queries: 6980
+Avg number of non-zero components: 43
+Number of documents: 8841823
+Avg number of non-zero components: 119
+Time 201 microsecs per query
+201
+Space Usage:
+	Forward Index: 4313529200 Bytes
+	Posting Lists: 2438954578 Bytes
+	Knn: 0 Bytes
+	Total: 6752483778 Bytes

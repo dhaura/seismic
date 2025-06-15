@@ -167,3 +167,13 @@ ECIR 2025
   doi       = {10.1007/978-3-031-88714-7_43}
 }
 ```
+
+## Running Experiments on NERSC
+```bash
+module load python/3.13
+python3 -m venv venv
+source venv/bin/activate
+pip install -r scripts/requirements.txt
+module load rust
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```

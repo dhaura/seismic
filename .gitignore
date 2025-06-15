@@ -42,3 +42,6 @@ build/
 Thumbs.db
 
 *.ipynb_checkpoints/*
+
+# Log files
+*.log

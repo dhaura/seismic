@@ -1,0 +1,13 @@
+Number of Vectors: 8841823
+Number of Dimensions: 28679
+Avg number of components: 119.96
+
+Building the index...
+Configuration { pruning: GlobalThreshold { n_postings: 4000, max_fraction: 1.5 }, blocking: RandomKmeans { centroid_fraction: 0.1, min_cluster_size: 2, clustering_algorithm: RandomKmeans }, summarization: EnergyPreserving { summary_energy: 0.4 }, knn: KnnConfiguration { nknn: 0, knn_path: None }, batched_indexing: None }
+Distributing and pruning postings: 33 secs
+Number of posting lists: 28679
+Building summaries: 36 secs
+Time to build 70 secs (before serializing)
+Saving ... /pscratch/sd/d/dhaura/datasets/SpKNN/seismic/experiments/sparse_datasets/msmarco_v1_passage/cocondenser/indexes/sigir_2024_splade_cocondenser_centroid-fraction_0.1_clustering-algorithm_random-kmeans_kmeans-doc-cut_15_kmeans-pruning-factor_0.005_knn_0_n-postings_4000_summary-energy_0.4.index.seismic
+Ok(())
+Time to build 82 secs
