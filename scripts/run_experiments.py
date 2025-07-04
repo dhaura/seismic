@@ -172,7 +172,7 @@ def build_index(configs, experiment_dir):
         print(colored("ERROR: Indexing failed!", "red"))
         sys.exit(1)
 
-    print(colored("Index built successfully in {building_time} secs!", "yellow"))
+    print(colored(f"Index built successfully in {building_time} secs!", "yellow"))
     return building_time
 
 def compute_metric(configs, output_file, gt_file, metric):    
