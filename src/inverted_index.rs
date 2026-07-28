@@ -351,7 +351,149 @@ where
     }
 
     // Implementation of the pruning strategy that selects the `n_postings*dim` top postings globally, with a limit of `n_postings*max_fraction` per posting.
+    //
+    // Parallel implementation. The global threshold lambda (the value of the
+    // `tot_postings`-th largest posting) is found by par-sorting the sortable
+    // bit-keys of all values; postings are then distributed to their lists over
+    // a fixed number of doc-range chunks so the output does not depend on the
+    // thread count. Entries tied at lambda are admitted in doc order until the
+    // kept count reaches exactly `tot_postings`; each list keeps its top
+    // `n_postings * max_fraction` entries ordered by (value desc, doc asc).
+    // Matches the serial version exactly when all values are distinct; at
+    // value ties only the (previously heap-arbitrary) tie choice can differ.
     fn global_threshold_pruning(
+        dataset: &S,
+        n_postings: usize,
+        max_fraction: f32,
+    ) -> Vec<Vec<(ValueFor<S>, usize)>>
+    where
+        S: SeismicBuildDataset,
+    {
+        let input_dim = dataset.input_dim();
+        let max_list_len = (n_postings as f32 * max_fraction) as usize;
+        let tot_postings = (input_dim * n_postings).min(dataset.nnz());
+        if tot_postings == 0 {
+            return vec![Vec::new(); input_dim];
+        }
+
+        // Order-preserving bit transform: key(a) > key(b) <=> a > b for non-NaN floats.
+        #[inline(always)]
+        fn sort_key(v: f32) -> u32 {
+            let bits = v.to_bits();
+            if bits >> 31 == 1 { !bits } else { bits | 0x8000_0000 }
+        }
+
+        let t_selection = Instant::now();
+        let mut keys: Vec<u32> = (0..dataset.len())
+            .into_par_iter()
+            .flat_map_iter(|doc_id| {
+                dataset
+                    .get(doc_id as u64)
+                    .values()
+                    .iter()
+                    .map(|v| sort_key(v.to_f32().unwrap()))
+            })
+            .collect();
+        keys.par_sort_unstable_by(|a, b| b.cmp(a));
+        let lambda_key = keys[tot_postings - 1];
+        // Everything strictly above lambda is kept; ties at lambda share the rest.
+        let n_above = keys.partition_point(|&k| k > lambda_key);
+        let tie_budget = tot_postings - n_above;
+        drop(keys);
+        println!(
+            "  pruning breakdown: threshold selection: {:.1} secs",
+            t_selection.elapsed().as_secs_f64()
+        );
+
+        let t_distribute = Instant::now();
+        let n_docs = dataset.len();
+        let n_chunks = 256.min(n_docs);
+        let chunk_size = n_docs.div_ceil(n_chunks);
+        let chunk_ranges: Vec<std::ops::Range<usize>> = (0..n_docs)
+            .step_by(chunk_size)
+            .map(|start| start..(start + chunk_size).min(n_docs))
+            .collect();
+
+        // Per-chunk count of lambda-ties, turned into per-chunk admission quotas.
+        let ties_per_chunk: Vec<usize> = chunk_ranges
+            .par_iter()
+            .map(|range| {
+                range
+                    .clone()
+                    .map(|doc_id| {
+                        dataset
+                            .get(doc_id as u64)
+                            .values()
+                            .iter()
+                            .filter(|v| sort_key(v.to_f32().unwrap()) == lambda_key)
+                            .count()
+                    })
+                    .sum::<usize>()
+            })
+            .collect();
+        let mut tie_quotas = Vec::with_capacity(chunk_ranges.len());
+        let mut remaining_ties = tie_budget;
+        for &n_ties in &ties_per_chunk {
+            let quota = n_ties.min(remaining_ties);
+            tie_quotas.push(quota);
+            remaining_ties -= quota;
+        }
+
+        let chunk_buckets: Vec<Vec<Vec<(ValueFor<S>, usize)>>> = chunk_ranges
+            .par_iter()
+            .zip(tie_quotas.par_iter())
+            .map(|(range, &quota)| {
+                let mut buckets: Vec<Vec<(ValueFor<S>, usize)>> = vec![Vec::new(); input_dim];
+                let mut quota = quota;
+                for doc_id in range.clone() {
+                    let posting = dataset.get(doc_id as u64);
+                    for (&component, &value) in
+                        posting.components().iter().zip(posting.values().iter())
+                    {
+                        let key = sort_key(value.to_f32().unwrap());
+                        let keep = if key > lambda_key {
+                            true
+                        } else if key == lambda_key && quota > 0 {
+                            quota -= 1;
+                            true
+                        } else {
+                            false
+                        };
+                        if keep {
+                            buckets[component.as_()].push((value, doc_id));
+                        }
+                    }
+                }
+                buckets
+            })
+            .collect();
+
+        let new_inverted_pairs: Vec<Vec<(ValueFor<S>, usize)>> = (0..input_dim)
+            .into_par_iter()
+            .map(|component| {
+                let mut list: Vec<(ValueFor<S>, usize)> = chunk_buckets
+                    .iter()
+                    .flat_map(|buckets| buckets[component].iter().copied())
+                    .collect();
+                list.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(&b.1))
+                });
+                list.truncate(max_list_len);
+                list
+            })
+            .collect();
+        println!(
+            "  pruning breakdown: distribute: {:.1} secs",
+            t_distribute.elapsed().as_secs_f64()
+        );
+
+        new_inverted_pairs
+    }
+
+    // Serial reference implementation, kept as the oracle for the tests of the
+    // parallel version above.
+    #[cfg(test)]
+    fn global_threshold_pruning_serial(
         dataset: &S,
         n_postings: usize,
         max_fraction: f32,
@@ -606,7 +748,6 @@ where
             From<SparseVectorView<'a, ComponentFor<S>, f32>>,
         ValueFor<S>: vectorium::FromF32,
     {
-        print!("Distributing and pruning postings: ");
         let time = Instant::now();
 
         // Distribute pairs (score, doc_id) to corresponding components.
@@ -628,7 +769,7 @@ where
         };
 
         let elapsed = time.elapsed();
-        println!("{} secs", elapsed.as_secs());
+        println!("Distributing and pruning postings: {} secs", elapsed.as_secs());
 
         println!("Number of posting lists: {}", inverted_pairs.len());
 
@@ -638,18 +779,32 @@ where
 
         print!("Building summaries: ");
         let time = Instant::now();
-        // Build summaries and blocks for each posting list
-        let posting_lists: Vec<_> = inverted_pairs
+        let timings = crate::posting_list::BuildTimings::default();
+        // Build summaries and blocks for each posting list. Lists are
+        // dispatched longest-first (LPT): each list builds serially inside one
+        // worker, so a long list picked up near the end of the loop would
+        // leave the other workers idle for its whole clustering run. The
+        // per-list build is self-contained (fixed clustering seeds), so
+        // processing order does not affect the output; results are restored to
+        // component order below.
+        let mut order: Vec<usize> = (0..inverted_pairs.len()).collect();
+        order.sort_unstable_by_key(|&component| cmp::Reverse(inverted_pairs[component].len()));
+        let mut built: Vec<(usize, _)> = order
             .par_iter()
             .progress_count(inverted_pairs.len() as u64)
-            .enumerate()
-            .map(|(_component_id, posting_list)| {
-                PostingList::build(&dataset, posting_list, &config)
+            .map(|&component| {
+                (
+                    component,
+                    PostingList::build(&dataset, &inverted_pairs[component], &config, &timings),
+                )
             })
             .collect();
+        built.sort_unstable_by_key(|&(component, _)| component);
+        let posting_lists: Vec<_> = built.into_iter().map(|(_, list)| list).collect();
 
         let elapsed = time.elapsed();
         println!("{} secs", elapsed.as_secs());
+        timings.report(elapsed);
 
         if config.knn.nknn == 0 && config.knn.knn_path.is_none() {
             return Self {
@@ -771,6 +926,13 @@ mod tests {
         assert_eq!(results[1].vector, 0);
     }
 
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
     #[test]
     fn test_convert_dataset_preserves_postings() {
         let quantizer = PlainSparseQuantizer::<u16, f32, DotProduct>::new(4, 4);
@@ -804,5 +966,130 @@ mod tests {
             all_doc_ids.iter().all(|&id| id < len),
             "Doc IDs should be valid"
         );
+    }
+
+    type TestDataset = PlainSparseDataset<u16, f32, DotProduct>;
+
+    // Builds a random sparse dataset; `distinct_values` uses a shuffled
+    // permutation of 0..nnz as values (all distinct), otherwise values are
+    // quantized to 5 levels so that ties are massive.
+    fn make_pruning_dataset(n_docs: usize, dim: usize, distinct_values: bool) -> TestDataset {
+        let mut state = 42u64;
+        let quantizer = PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim);
+        let mut dataset = PlainSparseDatasetGrowable::new(quantizer);
+
+        let mut all_components: Vec<Vec<u16>> = Vec::with_capacity(n_docs);
+        let mut nnz = 0;
+        for _ in 0..n_docs {
+            let mut components: Vec<u16> = (0..6)
+                .map(|_| (lcg(&mut state) % dim as u64) as u16)
+                .collect();
+            components.sort_unstable();
+            components.dedup();
+            nnz += components.len();
+            all_components.push(components);
+        }
+        // Fisher-Yates shuffle of 0..nnz for distinct values.
+        let mut perm: Vec<usize> = (0..nnz).collect();
+        for i in (1..nnz).rev() {
+            perm.swap(i, (lcg(&mut state) % (i as u64 + 1)) as usize);
+        }
+        let mut counter = 0;
+        for components in &all_components {
+            let values: Vec<f32> = components
+                .iter()
+                .map(|_| {
+                    counter += 1;
+                    if distinct_values {
+                        0.5 + perm[counter - 1] as f32 * 0.001
+                    } else {
+                        0.1 + (lcg(&mut state) % 5) as f32 * 0.2
+                    }
+                })
+                .collect();
+            dataset.push(SparseVectorView::new(
+                components.as_slice(),
+                values.as_slice(),
+            ));
+        }
+        dataset.into()
+    }
+
+    // With all-distinct values the parallel pruning must reproduce the serial
+    // oracle byte-for-byte (content and order of every list), including with an
+    // active per-list cap and with tot_postings exceeding nnz.
+    #[test]
+    fn test_global_threshold_pruning_matches_serial_on_distinct_values() {
+        let dataset = make_pruning_dataset(200, 30, true);
+        for (n_postings, max_fraction) in [(3usize, 1.5f32), (10, 2.0), (10_000, 1.0)] {
+            let parallel = InvertedIndexBase::<TestDataset>::global_threshold_pruning(
+                &dataset,
+                n_postings,
+                max_fraction,
+            );
+            let serial = InvertedIndexBase::<TestDataset>::global_threshold_pruning_serial(
+                &dataset,
+                n_postings,
+                max_fraction,
+            );
+            assert_eq!(
+                parallel, serial,
+                "mismatch at n_postings={n_postings}, max_fraction={max_fraction}"
+            );
+        }
+    }
+
+    // With massive value ties only the identity of the entries tied at the
+    // threshold lambda may differ from the serial oracle (its tie choice was
+    // heap-order-arbitrary). Everything strictly above lambda must be
+    // identical, the global kept count must match exactly, and every list must
+    // be sorted by (value desc, doc asc).
+    #[test]
+    fn test_global_threshold_pruning_with_ties() {
+        let dataset = make_pruning_dataset(200, 30, false);
+        let n_postings = 4;
+        let max_fraction = 1_000_000.0; // no per-list cap: tie-set differences would make per-list caps cut different lengths
+
+        let parallel = InvertedIndexBase::<TestDataset>::global_threshold_pruning(
+            &dataset,
+            n_postings,
+            max_fraction,
+        );
+        let serial = InvertedIndexBase::<TestDataset>::global_threshold_pruning_serial(
+            &dataset,
+            n_postings,
+            max_fraction,
+        );
+
+        let tot: usize = parallel.iter().map(|l| l.len()).sum();
+        let tot_serial: usize = serial.iter().map(|l| l.len()).sum();
+        assert_eq!(tot, tot_serial);
+        assert_eq!(tot, (dataset.input_dim() * n_postings).min(dataset.nnz()));
+
+        let lambda = parallel
+            .iter()
+            .flatten()
+            .map(|(v, _)| *v)
+            .fold(f32::INFINITY, f32::min);
+        let lambda_serial = serial
+            .iter()
+            .flatten()
+            .map(|(v, _)| *v)
+            .fold(f32::INFINITY, f32::min);
+        assert_eq!(lambda, lambda_serial);
+
+        for (par_list, ser_list) in parallel.iter().zip(serial.iter()) {
+            // Entries strictly above lambda are tie-independent: must match as sets.
+            let mut par_above: Vec<_> = par_list.iter().filter(|(v, _)| *v > lambda).collect();
+            let mut ser_above: Vec<_> = ser_list.iter().filter(|(v, _)| *v > lambda).collect();
+            par_above.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ser_above.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(par_above, ser_above);
+
+            // (value desc, doc asc) ordering within each parallel list.
+            for pair in par_list.windows(2) {
+                assert!(pair[0].0 > pair[1].0 || (pair[0].0 == pair[1].0 && pair[0].1 < pair[1].1));
+            }
+        }
     }
 }

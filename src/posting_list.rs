@@ -16,12 +16,54 @@ use crate::utils::{
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use num_traits::ToPrimitive;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use num_traits::{AsPrimitive, ToPrimitive};
 use vectorium::dataset::ScoredRange;
 use vectorium::{
     ComponentType, DatasetGrowable, Distance, DotProduct, QueryEvaluator, SpaceUsage,
     SparseDataset, SparseDatasetGrowable, SparseVectorEncoder, SparseVectorView, VectorEncoder,
 };
+
+/// Per-phase CPU-time accumulators for [`PostingList::build`], summed across
+/// all rayon workers (so the totals exceed the wall-clock of the parallel loop
+/// by ~the parallelism factor — use them for the *relative* split, not as a
+/// wall-clock figure). Instrumentation only.
+#[derive(Default)]
+pub(crate) struct BuildTimings {
+    clustering_ns: AtomicU64,
+    summary_ns: AtomicU64,
+    packing_ns: AtomicU64,
+}
+
+impl BuildTimings {
+    #[inline]
+    fn add(counter: &AtomicU64, start: Instant) {
+        counter.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Print the per-phase split alongside the measured wall-clock of the
+    /// parallel build loop.
+    pub fn report(&self, wall: Duration) {
+        let s = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e9;
+        let (c, m, p) = (
+            s(&self.clustering_ns),
+            s(&self.summary_ns),
+            s(&self.packing_ns),
+        );
+        let tot = c + m + p;
+        let pct = |x: f64| if tot > 0.0 { 100.0 * x / tot } else { 0.0 };
+        println!(
+            "  build-phase CPU-time (summed over workers; parallel-loop wall {:.0}s):",
+            wall.as_secs_f64()
+        );
+        println!("    clustering (kmeans): {:.0}s ({:.1}%)", c, pct(c));
+        println!("    summaries:           {:.0}s ({:.1}%)", m, pct(m));
+        println!("    packing:             {:.0}s ({:.1}%)", p, pct(p));
+        println!("    total CPU:           {:.0}s", tot);
+    }
+}
 
 /// Instead of storing doc_ids we store their offsets in the forward_index and the lengths of the vectors
 /// This allows us to save the random accesses that would be needed to access exactly these values from the
@@ -283,7 +325,6 @@ impl<C: ComponentType> PostingList<C> {
                 centroid_id_a == centroid_id_b
             })
         {
-            let _centroid_id = group[0].0;
             for &(_centroid_id, doc_id) in group {
                 reordered_posting_list.push(doc_id);
             }
@@ -303,68 +344,111 @@ impl<C: ComponentType> PostingList<C> {
         dataset: &S,
         block: &[usize],
         n_components: usize,
+        scratch: &mut SummaryScratch<ComponentFor<S>>,
     ) -> Vec<(ComponentFor<S>, f32)>
     where
         S: SeismicBuildDataset,
     {
-        let mut hash = std::collections::HashMap::new();
-        for &doc_id in block.iter() {
-            let posting = dataset.get(doc_id as u64);
-            let components = posting.components();
-            let values = posting.values();
-            for (&c, &v) in components.iter().zip(values) {
-                let v = v.to_f32().unwrap();
-                hash.entry(c)
-                    .and_modify(|h| *h = if *h < v { v } else { *h })
-                    .or_insert(v);
-            }
+        if n_components == 0 {
+            return Vec::new();
         }
-
-        hash.into_iter()
-            .k_largest_by(n_components, |a, b| a.1.total_cmp(&b.1))
-            .sorted_unstable_by_key(|&(id, _)| id)
-            .collect()
+        accumulate_block_max(scratch, dataset, block);
+        let pairs = &mut scratch.pairs;
+        if pairs.len() > n_components {
+            pairs.select_nth_unstable_by(n_components - 1, |a, b| b.1.total_cmp(&a.1));
+            pairs.truncate(n_components);
+        }
+        pairs.sort_unstable_by_key(|&(id, _)| id);
+        pairs.clone()
     }
 
     fn energy_preserving_summary<S>(
         dataset: &S,
         block: &[usize],
         fraction: f32,
+        scratch: &mut SummaryScratch<ComponentFor<S>>,
     ) -> Vec<(ComponentFor<S>, f32)>
     where
         S: SeismicBuildDataset,
     {
-        let mut hash = std::collections::HashMap::new();
-        for &doc_id in block.iter() {
-            let posting = dataset.get(doc_id as u64);
-            let components = posting.components();
-            let values = posting.values();
-            for (&c, &v) in components.iter().zip(values) {
-                let v = v.to_f32().unwrap();
-                hash.entry(c)
-                    .and_modify(|h| *h = if *h < v { v } else { *h })
-                    .or_insert(v);
-            }
-        }
+        accumulate_block_max(scratch, dataset, block);
+        let pairs = &mut scratch.pairs;
 
-        let mut components_values: Vec<_> = hash.into_iter().collect();
-
-        components_values.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        let total_sum: f32 = components_values
-            .iter()
-            .map(|(_, x)| x.to_f32().unwrap())
-            .sum();
+        pairs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        let total_sum: f32 = pairs.iter().map(|&(_, v)| v).sum();
 
         let until = total_sum * fraction;
         let mut acc = 0_f32;
-        components_values
-            .into_iter()
-            .take_while_inclusive(|(_, v)| {
-                acc += v.to_f32().unwrap();
-                acc < until
-            })
-            .sorted_unstable_by_key(|&(id, _)| id)
-            .collect()
+        let mut kept = pairs.len();
+        for (i, &(_, v)) in pairs.iter().enumerate() {
+            acc += v;
+            if acc >= until {
+                kept = i + 1;
+                break;
+            }
+        }
+        pairs.truncate(kept);
+        pairs.sort_unstable_by_key(|&(id, _)| id);
+        pairs.clone()
+    }
+}
+
+/// Reusable scratch for block summarization: a dense component→slot table
+/// (epoch-stamped, so switching to the next block is O(1) instead of a clear)
+/// replacing the per-block `HashMap<C, f32>`. One instance per
+/// [`PostingList::build`] call, reused across all blocks of the list.
+struct SummaryScratch<C> {
+    /// Epoch stamp per component; `slots[c]` is valid iff `stamps[c] == epoch`.
+    stamps: Vec<u32>,
+    /// Index into `pairs` of the entry accumulating component `c`'s max.
+    slots: Vec<u32>,
+    epoch: u32,
+    /// Distinct (component, max value) pairs of the current block, in
+    /// first-touch order.
+    pairs: Vec<(C, f32)>,
+}
+
+impl<C> SummaryScratch<C> {
+    fn new(input_dim: usize) -> Self {
+        Self {
+            stamps: vec![0; input_dim],
+            slots: vec![0; input_dim],
+            epoch: 0,
+            pairs: Vec::new(),
+        }
+    }
+}
+
+/// Fill `scratch.pairs` with one (component, max value) entry per distinct
+/// component appearing in `block`'s documents.
+fn accumulate_block_max<S>(
+    scratch: &mut SummaryScratch<ComponentFor<S>>,
+    dataset: &S,
+    block: &[usize],
+) where
+    S: SeismicBuildDataset,
+{
+    scratch.epoch += 1;
+    let epoch = scratch.epoch;
+    scratch.pairs.clear();
+    for &doc_id in block.iter() {
+        let posting = dataset.get(doc_id as u64);
+        let components = posting.components();
+        let values = posting.values();
+        for (&c, &v) in components.iter().zip(values) {
+            let v = v.to_f32().unwrap();
+            let idx: usize = c.as_();
+            if scratch.stamps[idx] != epoch {
+                scratch.stamps[idx] = epoch;
+                scratch.slots[idx] = scratch.pairs.len() as u32;
+                scratch.pairs.push((c, v));
+            } else {
+                let slot = &mut scratch.pairs[scratch.slots[idx] as usize].1;
+                if v > *slot {
+                    *slot = v;
+                }
+            }
+        }
     }
 }
 
@@ -376,6 +460,7 @@ where
         dataset: &S,
         postings: &[(ValueFor<S>, usize)],
         config: &Configuration,
+        timings: &BuildTimings,
     ) -> Self
     where
         S: SeismicBuildDataset,
@@ -383,6 +468,7 @@ where
     {
         let mut posting_list: Vec<_> = postings.iter().map(|(_, docid)| *docid).collect();
 
+        let t_cluster = Instant::now();
         let block_offsets = match config.blocking {
             BlockingStrategy::FixedSize { block_size } => {
                 Self::fixed_size_blocking(&posting_list, block_size)
@@ -400,12 +486,15 @@ where
                 clustering_algorithm,
             ),
         };
+        BuildTimings::add(&timings.clustering_ns, t_cluster);
 
+        let t_summary = Instant::now();
         let quantizer = vectorium::PlainSparseQuantizer::<C, f32, vectorium::DotProduct>::new(
             dataset.input_dim(),
             dataset.input_dim(),
         );
         let mut summary = SparseDatasetGrowable::new(quantizer);
+        let mut scratch = SummaryScratch::new(dataset.input_dim());
         for (components, values) in
             block_offsets
                 .array_windows()
@@ -416,6 +505,7 @@ where
                                 dataset,
                                 &posting_list[block_start..block_end],
                                 n_components,
+                                &mut scratch,
                             )
                         }
 
@@ -425,6 +515,7 @@ where
                             dataset,
                             &posting_list[block_start..block_end],
                             fraction,
+                            &mut scratch,
                         ),
                     };
                     let (components, values): (Vec<C>, Vec<f32>) = summary_vec.into_iter().unzip();
@@ -436,11 +527,14 @@ where
                 values.as_slice(),
             ));
         }
+        BuildTimings::add(&timings.summary_ns, t_summary);
 
+        let t_pack = Instant::now();
         let packed_postings: Vec<_> = posting_list
             .iter()
             .map(|&doc_id| PackedPostingBlock::pack(dataset.range_from_id(doc_id as u64)))
             .collect();
+        BuildTimings::add(&timings.packing_ns, t_pack);
 
         Self {
             packed_postings: packed_postings.into_boxed_slice(),

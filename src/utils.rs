@@ -103,17 +103,67 @@ where
         .zip(vector.values().iter().copied())
 }
 
-fn compute_centroid_assignments_approx_dot_product<S, T>(
+/// CSR-layout inverted index over the centroid vectors, mirroring the flat
+/// offsets + postings layout of `QuantizedSummary`: one dense offset per
+/// component and a single contiguous postings array, instead of one heap
+/// allocation per component. Scores are converted to `f32` once at build time
+/// so the scoring loop reads 8-byte `(centroid_slot, score)` entries.
+pub(crate) struct FastInvertedIndex {
+    offsets: Vec<u32>,
+    postings: Vec<(u32, f32)>,
+}
+
+impl FastInvertedIndex {
+    fn new<S>(dataset: &S, centroid_doc_ids: &[usize]) -> Self
+    where
+        S: SeismicBuildDataset,
+    {
+        let dim = dataset.input_dim();
+
+        // Counting sort: per-component counts, prefix-sum, then fill.
+        let mut offsets = vec![0_u32; dim + 1];
+        for &centroid_doc_id in centroid_doc_ids {
+            let posting = dataset.get(centroid_doc_id as u64);
+            for &c in posting.components() {
+                offsets[c.as_() + 1] += 1;
+            }
+        }
+        for i in 1..=dim {
+            offsets[i] += offsets[i - 1];
+        }
+
+        let mut postings = vec![(0_u32, 0_f32); offsets[dim] as usize];
+        let mut cursors = offsets[..dim].to_vec();
+        // Filling in slot order keeps each component's slice sorted by
+        // centroid slot, i.e., the same accumulation order as a per-component
+        // push loop.
+        for (centroid_slot, &centroid_doc_id) in centroid_doc_ids.iter().enumerate() {
+            let posting = dataset.get(centroid_doc_id as u64);
+            for (c, score) in iter_components_values(&posting) {
+                let cursor = &mut cursors[c.as_()];
+                postings[*cursor as usize] = (centroid_slot as u32, score.to_f32().unwrap());
+                *cursor += 1;
+            }
+        }
+
+        Self { offsets, postings }
+    }
+
+    #[inline]
+    fn postings(&self, component_id: usize) -> &[(u32, f32)] {
+        &self.postings[self.offsets[component_id] as usize..self.offsets[component_id + 1] as usize]
+    }
+}
+
+fn compute_centroid_assignments_approx_dot_product<S>(
     doc_ids: &[usize],
-    inverted_index: &[Vec<(usize, T)>],
+    inverted_index: &FastInvertedIndex,
     dataset: &S,
     centroids_doc_ids: &[usize],
-    to_avoid: &HashSet<usize>,
     doc_cut: usize,
 ) -> Vec<(usize, usize)>
 where
     S: SeismicBuildDataset,
-    T: ValueType,
 {
     let mut scores = vec![0_f32; centroids_doc_ids.len()];
 
@@ -126,16 +176,17 @@ where
                 a.1.to_f32().unwrap().total_cmp(&b.1.to_f32().unwrap())
             });
             for (component_id, value) in iter {
-                for &(centroid_id, score) in inverted_index[component_id.as_()].iter() {
-                    scores[centroid_id] += score.to_f32().unwrap() * value.to_f32().unwrap();
+                let value = value.to_f32().unwrap();
+                let postings = inverted_index.postings(component_id.as_());
+                for &(centroid_slot, score) in postings {
+                    scores[centroid_slot as usize] += score * value;
                 }
             }
 
             let (&max_centroid_doc_id, _) = centroids_doc_ids
                 .iter()
                 .zip(scores.iter())
-                .filter(|(centroid_doc_id, _)| !to_avoid.contains(centroid_doc_id))
-                .max_by(|a, b| a.1.to_f32().unwrap().total_cmp(&b.1.to_f32().unwrap()))
+                .max_by(|a, b| a.1.total_cmp(b.1))
                 .unwrap_or((&centroids_doc_ids[0], &0.0));
 
             (max_centroid_doc_id, doc_id)
@@ -150,7 +201,7 @@ where
 /// The function uses a simple pruned inverted index to speed up the computation and computes the
 /// true dot product between the document and the centroids.
 /// The parameter `doc_cut` specifies how many components of the document vector to consider while computing the dot product.
-pub(crate) fn do_random_kmeans_on_docids_ii_approx_dot_product<S>(
+pub fn do_random_kmeans_on_docids_ii_approx_dot_product<S>(
     doc_ids: &[usize],
     n_clusters: usize,
     dataset: &S,
@@ -168,21 +219,13 @@ where
         .collect();
 
     // Build an inverted index for the centroids
-    let mut inverted_index = vec![Vec::new(); dataset.input_dim()];
-
-    for (centroid_id, &centroid_doc_id) in centroid_doc_ids.iter().enumerate() {
-        let posting = dataset.get(centroid_doc_id as u64);
-        for (c, score) in iter_components_values(&posting) {
-            inverted_index[c.as_()].push((centroid_id, score));
-        }
-    }
+    let inverted_index = FastInvertedIndex::new(dataset, &centroid_doc_ids);
 
     let mut centroid_assignments = compute_centroid_assignments_approx_dot_product(
         doc_ids,
         &inverted_index,
         dataset,
         &centroid_doc_ids,
-        &HashSet::new(),
         doc_cut,
     );
 
@@ -214,16 +257,43 @@ where
         "Final assignment size mismatch"
     );
 
-    let centroid_assignments = compute_centroid_assignments_approx_dot_product(
-        to_be_reassigned.as_slice(),
-        &inverted_index,
-        dataset,
-        &centroid_doc_ids,
-        &removed_centroids,
-        doc_cut,
-    );
+    // The first pass dissolves the large majority of the clusters, so scoring
+    // the reassigned documents against `inverted_index` would spend most of its
+    // time on centroids that are no longer eligible. Score them against a
+    // second index holding only the survivors instead: the `scores` array, the
+    // posting traversal and the argmax all shrink by the same factor.
+    //
+    // Filtering preserves the order of `centroid_doc_ids`, so each surviving
+    // centroid accumulates the same summands in the same order and `max_by`
+    // (which keeps the last maximum) breaks ties identically: the assignments
+    // are bit-for-bit the ones the full index would have produced.
+    if !to_be_reassigned.is_empty() {
+        let surviving: Vec<usize> = centroid_doc_ids
+            .iter()
+            .copied()
+            .filter(|centroid_doc_id| !removed_centroids.contains(centroid_doc_id))
+            .collect();
+        let surviving_index = FastInvertedIndex::new(dataset, &surviving);
 
-    final_assignments.extend(centroid_assignments);
+        if surviving.is_empty() {
+            // Every centroid that drew a document was dissolved and none was
+            // left untouched. The full-index argmax used to reduce an empty
+            // iterator here and fall back to the first centroid; keep that.
+            final_assignments.extend(
+                to_be_reassigned
+                    .iter()
+                    .map(|&doc_id| (centroid_doc_ids[0], doc_id)),
+            );
+        } else {
+            final_assignments.extend(compute_centroid_assignments_approx_dot_product(
+                to_be_reassigned.as_slice(),
+                &surviving_index,
+                dataset,
+                &surviving,
+                doc_cut,
+            ));
+        }
+    }
 
     assert_eq!(
         final_assignments.len(),
@@ -517,4 +587,59 @@ where
     final_assignments.sort();
 
     final_assignments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_chacha::ChaCha8Rng;
+    use vectorium::{
+        Dataset, DatasetGrowable, PlainSparseDataset, PlainSparseDatasetGrowable,
+        PlainSparseQuantizer,
+    };
+
+    #[test]
+    fn test_fast_inverted_index_matches_naive_build() {
+        let seed = 42;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let n_vecs = 200;
+        let dim = 500;
+
+        let quantizer = PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim);
+        let mut growable = PlainSparseDatasetGrowable::<u16, f32, DotProduct>::new(quantizer);
+        for _ in 0..n_vecs {
+            let nnz = rng.random_range(10..=50);
+            let mut components: Vec<usize> = (0..dim).collect();
+            components.shuffle(&mut rng);
+            components.truncate(nnz);
+            components.sort_unstable();
+            let components: Vec<u16> = components.into_iter().map(|c| c as u16).collect();
+            let values: Vec<f32> = (0..nnz).map(|_| rng.random::<f32>()).collect();
+            growable.push(SparseVectorView::new(
+                components.as_slice(),
+                values.as_slice(),
+            ));
+        }
+        let dataset: PlainSparseDataset<u16, f32, DotProduct> = growable.into();
+
+        let centroid_doc_ids: Vec<usize> = (0..n_vecs).step_by(3).collect();
+        let fast = FastInvertedIndex::new(&dataset, &centroid_doc_ids);
+
+        let mut naive = vec![Vec::new(); dataset.input_dim()];
+        for (centroid_slot, &centroid_doc_id) in centroid_doc_ids.iter().enumerate() {
+            let posting = dataset.get(centroid_doc_id as u64);
+            for (c, score) in iter_components_values(&posting) {
+                naive[c as usize].push((centroid_slot as u32, score));
+            }
+        }
+
+        for c in 0..dataset.input_dim() {
+            assert_eq!(
+                fast.postings(c),
+                naive[c].as_slice(),
+                "mismatch at component {}",
+                c
+            );
+        }
+    }
 }
