@@ -353,14 +353,15 @@ where
     // Implementation of the pruning strategy that selects the `n_postings*dim` top postings globally, with a limit of `n_postings*max_fraction` per posting.
     //
     // Parallel implementation. The global threshold lambda (the value of the
-    // `tot_postings`-th largest posting) is found by par-sorting the sortable
-    // bit-keys of all values; postings are then distributed to their lists over
-    // a fixed number of doc-range chunks so the output does not depend on the
-    // thread count. Entries tied at lambda are admitted in doc order until the
-    // kept count reaches exactly `tot_postings`; each list keeps its top
-    // `n_postings * max_fraction` entries ordered by (value desc, doc asc).
-    // Matches the serial version exactly when all values are distinct; at
-    // value ties only the (previously heap-arbitrary) tie choice can differ.
+    // `tot_postings`-th largest posting) is found by par-sorting all values
+    // under the IEEE total order; all postings with value >= lambda are then
+    // distributed to their lists in parallel (output independent of thread
+    // count since each list is canonically sorted by (value desc, doc asc)),
+    // each list is capped at `n_postings * max_fraction` entries, and surplus
+    // entries tied at lambda are finally popped from list tails in component
+    // order until at most `tot_postings` postings remain. Matches the serial
+    // version exactly when all values are distinct; at value ties only the
+    // (previously heap-arbitrary) tie choice can differ.
     fn global_threshold_pruning(
         dataset: &S,
         n_postings: usize,
@@ -376,29 +377,19 @@ where
             return vec![Vec::new(); input_dim];
         }
 
-        // Order-preserving bit transform: key(a) > key(b) <=> a > b for non-NaN floats.
-        #[inline(always)]
-        fn sort_key(v: f32) -> u32 {
-            let bits = v.to_bits();
-            if bits >> 31 == 1 { !bits } else { bits | 0x8000_0000 }
-        }
-
-        let mut keys: Vec<u32> = (0..dataset.len())
+        let mut values: Vec<f32> = (0..dataset.len())
             .into_par_iter()
             .flat_map_iter(|doc_id| {
                 dataset
                     .get(doc_id as u64)
                     .values()
                     .iter()
-                    .map(|v| sort_key(v.to_f32().unwrap()))
+                    .map(|v| v.to_f32().unwrap())
             })
             .collect();
-        keys.par_sort_unstable_by(|a, b| b.cmp(a));
-        let lambda_key = keys[tot_postings - 1];
-        // Everything strictly above lambda is kept; ties at lambda share the rest.
-        let n_above = keys.partition_point(|&k| k > lambda_key);
-        let tie_budget = tot_postings - n_above;
-        drop(keys);
+        values.par_sort_unstable_by(|a, b| b.total_cmp(a));
+        let lambda = values[tot_postings - 1];
+        drop(values);
 
         let n_docs = dataset.len();
         let n_chunks = 256.min(n_docs);
@@ -408,52 +399,16 @@ where
             .map(|start| start..(start + chunk_size).min(n_docs))
             .collect();
 
-        // Per-chunk count of lambda-ties, turned into per-chunk admission quotas.
-        let ties_per_chunk: Vec<usize> = chunk_ranges
-            .par_iter()
-            .map(|range| {
-                range
-                    .clone()
-                    .map(|doc_id| {
-                        dataset
-                            .get(doc_id as u64)
-                            .values()
-                            .iter()
-                            .filter(|v| sort_key(v.to_f32().unwrap()) == lambda_key)
-                            .count()
-                    })
-                    .sum::<usize>()
-            })
-            .collect();
-        let mut tie_quotas = Vec::with_capacity(chunk_ranges.len());
-        let mut remaining_ties = tie_budget;
-        for &n_ties in &ties_per_chunk {
-            let quota = n_ties.min(remaining_ties);
-            tie_quotas.push(quota);
-            remaining_ties -= quota;
-        }
-
         let chunk_buckets: Vec<Vec<Vec<(ValueFor<S>, usize)>>> = chunk_ranges
             .par_iter()
-            .zip(tie_quotas.par_iter())
-            .map(|(range, &quota)| {
+            .map(|range| {
                 let mut buckets: Vec<Vec<(ValueFor<S>, usize)>> = vec![Vec::new(); input_dim];
-                let mut quota = quota;
                 for doc_id in range.clone() {
                     let posting = dataset.get(doc_id as u64);
                     for (&component, &value) in
                         posting.components().iter().zip(posting.values().iter())
                     {
-                        let key = sort_key(value.to_f32().unwrap());
-                        let keep = if key > lambda_key {
-                            true
-                        } else if key == lambda_key && quota > 0 {
-                            quota -= 1;
-                            true
-                        } else {
-                            false
-                        };
-                        if keep {
+                        if value.to_f32().unwrap().total_cmp(&lambda).is_ge() {
                             buckets[component.as_()].push((value, doc_id));
                         }
                     }
@@ -462,7 +417,7 @@ where
             })
             .collect();
 
-        let new_inverted_pairs: Vec<Vec<(ValueFor<S>, usize)>> = (0..input_dim)
+        let mut new_inverted_pairs: Vec<Vec<(ValueFor<S>, usize)>> = (0..input_dim)
             .into_par_iter()
             .map(|component| {
                 let mut list: Vec<(ValueFor<S>, usize)> = chunk_buckets
@@ -476,6 +431,26 @@ where
                 list
             })
             .collect();
+
+        // All values >= lambda were admitted; trim surplus lambda-ties from list
+        // tails (in component order) until the kept count is `tot_postings`. Ties
+        // are contiguous at each tail: lambda is the minimum admitted value and
+        // lists are sorted by value desc.
+        let total: usize = new_inverted_pairs.iter().map(Vec::len).sum();
+        let mut excess = total.saturating_sub(tot_postings);
+        for list in new_inverted_pairs.iter_mut() {
+            if excess == 0 {
+                break;
+            }
+            while excess > 0
+                && list
+                    .last()
+                    .is_some_and(|(v, _)| v.to_f32().unwrap().total_cmp(&lambda).is_eq())
+            {
+                list.pop();
+                excess -= 1;
+            }
+        }
 
         new_inverted_pairs
     }
@@ -759,7 +734,10 @@ where
         };
 
         let elapsed = time.elapsed();
-        println!("Distributing and pruning postings: {} secs", elapsed.as_secs());
+        println!(
+            "Distributing and pruning postings: {} secs",
+            elapsed.as_secs()
+        );
 
         println!("Number of posting lists: {}", inverted_pairs.len());
 
@@ -1076,6 +1054,46 @@ mod tests {
 
             // (value desc, doc asc) ordering within each parallel list.
             for pair in par_list.windows(2) {
+                assert!(pair[0].0 > pair[1].0 || (pair[0].0 == pair[1].0 && pair[0].1 < pair[1].1));
+            }
+        }
+    }
+
+    // Ties combined with an active per-list cap: no oracle comparison (the
+    // serial tie choice diverges once the cap cuts lists), so check the
+    // invariants instead: per-list cap respected, global budget respected,
+    // nothing below the independently computed lambda, (value desc, doc asc)
+    // ordering.
+    #[test]
+    fn test_global_threshold_pruning_ties_with_cap() {
+        let dataset = make_pruning_dataset(200, 30, false);
+        let n_postings = 4;
+        let max_fraction = 1.5;
+        let max_list_len = (n_postings as f32 * max_fraction) as usize;
+        let tot_postings = (dataset.input_dim() * n_postings).min(dataset.nnz());
+
+        let pruned = InvertedIndexBase::<TestDataset>::global_threshold_pruning(
+            &dataset,
+            n_postings,
+            max_fraction,
+        );
+
+        let mut values: Vec<f32> = dataset
+            .iter()
+            .flat_map(|posting| posting.values().to_vec())
+            .collect();
+        values.sort_unstable_by(|a, b| b.total_cmp(a));
+        let lambda = values[tot_postings - 1];
+
+        let tot: usize = pruned.iter().map(|l| l.len()).sum();
+        assert!(tot <= tot_postings);
+
+        for list in &pruned {
+            assert!(list.len() <= max_list_len);
+            for (v, _) in list {
+                assert!(*v >= lambda);
+            }
+            for pair in list.windows(2) {
                 assert!(pair[0].0 > pair[1].0 || (pair[0].0 == pair[1].0 && pair[0].1 < pair[1].1));
             }
         }

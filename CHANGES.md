@@ -2,13 +2,16 @@
 
 Optimizations to the index build. None of them changes the built index: the
 produced posting lists, blocks, and summaries are identical to the previous
-implementation.
+implementation, up to the arbitrary choice among postings tied at the global
+pruning threshold.
 
 - **Parallel global-threshold pruning.** The global threshold is found by
   sorting all posting scores in parallel instead of scanning them through a
-  serial heap; postings are then distributed to components in parallel, with
-  deterministic (thread-count-independent) handling of scores tied at the
-  threshold. The old serial implementation is kept as a test oracle.
+  serial heap; all postings scoring at or above the threshold are then
+  distributed to components in parallel, and the surplus of scores tied at
+  the threshold is dropped deterministically (thread-count-independently)
+  from the tails of the posting lists. The old serial implementation is kept
+  as a test oracle.
   → `global_threshold_pruning` in `src/inverted_index.rs`
 
 - **Longest-first (LPT) posting-list dispatch.** Posting lists are built
