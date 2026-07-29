@@ -22,7 +22,10 @@ pruning threshold.
 - **Dense scratch for summaries.** The per-block `HashMap` used to accumulate
   component maxima is replaced by a dense epoch-stamped scratch table reused
   across all blocks of a posting list, and top-k selection uses
-  `select_nth_unstable_by` instead of heap-based `k_largest_by`.
+  `select_nth_unstable_by` instead of heap-based `k_largest_by`. Above 2^20
+  components — where allocating the dense table for every posting list would
+  dominate the build — the scratch falls back to an `FxHashMap`-backed slot
+  table with the same layout, producing identical summaries.
   → `SummaryScratch`, `accumulate_block_max`, `fixed_size_summary`,
   `energy_preserving_summary` in `src/posting_list.rs`
 

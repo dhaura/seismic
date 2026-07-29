@@ -1,4 +1,5 @@
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 
 use crate::QuantizedSummary;
@@ -306,6 +307,7 @@ impl<C: ComponentType> PostingList<C> {
     ) -> Vec<(ComponentFor<S>, f32)>
     where
         S: SeismicBuildDataset,
+        ComponentFor<S>: Hash,
     {
         if n_components == 0 {
             return Vec::new();
@@ -328,6 +330,7 @@ impl<C: ComponentType> PostingList<C> {
     ) -> Vec<(ComponentFor<S>, f32)>
     where
         S: SeismicBuildDataset,
+        ComponentFor<S>: Hash,
     {
         accumulate_block_max(scratch, dataset, block);
         let pairs = &mut scratch.pairs;
@@ -351,16 +354,34 @@ impl<C: ComponentType> PostingList<C> {
     }
 }
 
-/// Reusable scratch for block summarization: a dense component→slot table
-/// (epoch-stamped, so switching to the next block is O(1) instead of a clear)
-/// replacing the per-block `HashMap<C, f32>`. One instance per
-/// [`PostingList::build`] call, reused across all blocks of the list.
+/// Above this dimension the dense per-component table of [`SummaryScratch`]
+/// (two `u32`s per component, allocated once per posting list) is replaced by
+/// a hash map — the same cutoff vectorium uses to densify sparse queries.
+const DENSE_SCRATCH_MAX_DIM: usize = 1 << 20;
+
+/// Component → index-into-`pairs` lookup of [`SummaryScratch`].
+enum ComponentSlots<C> {
+    /// Dense table; `slots[c]` is the index into `pairs` of the entry
+    /// accumulating component `c`'s max, valid iff `stamps[c] == epoch`
+    /// (epoch-stamped so switching to the next block is O(1) instead of a
+    /// clear).
+    Dense {
+        stamps: Vec<u32>,
+        slots: Vec<u32>,
+        epoch: u32,
+    },
+    /// Fallback for very high `input_dim`, where allocating the dense table
+    /// for every posting list would dominate the build.
+    Sparse(FxHashMap<C, u32>),
+}
+
+/// Reusable scratch for block summarization: a component→slot table replacing
+/// the per-block `HashMap<C, f32>`, dense for small `input_dim` and hash-based
+/// above [`DENSE_SCRATCH_MAX_DIM`]. Both variants fill `pairs` identically.
+/// One instance per [`PostingList::build`] call, reused across all blocks of
+/// the list.
 struct SummaryScratch<C> {
-    /// Epoch stamp per component; `slots[c]` is valid iff `stamps[c] == epoch`.
-    stamps: Vec<u32>,
-    /// Index into `pairs` of the entry accumulating component `c`'s max.
-    slots: Vec<u32>,
-    epoch: u32,
+    table: ComponentSlots<C>,
     /// Distinct (component, max value) pairs of the current block, in
     /// first-touch order.
     pairs: Vec<(C, f32)>,
@@ -368,10 +389,27 @@ struct SummaryScratch<C> {
 
 impl<C> SummaryScratch<C> {
     fn new(input_dim: usize) -> Self {
+        if input_dim < DENSE_SCRATCH_MAX_DIM {
+            Self::dense(input_dim)
+        } else {
+            Self::sparse()
+        }
+    }
+
+    fn dense(input_dim: usize) -> Self {
         Self {
-            stamps: vec![0; input_dim],
-            slots: vec![0; input_dim],
-            epoch: 0,
+            table: ComponentSlots::Dense {
+                stamps: vec![0; input_dim],
+                slots: vec![0; input_dim],
+                epoch: 0,
+            },
+            pairs: Vec::new(),
+        }
+    }
+
+    fn sparse() -> Self {
+        Self {
+            table: ComponentSlots::Sparse(FxHashMap::default()),
             pairs: Vec::new(),
         }
     }
@@ -385,25 +423,58 @@ fn accumulate_block_max<S>(
     block: &[usize],
 ) where
     S: SeismicBuildDataset,
+    ComponentFor<S>: Hash,
 {
-    scratch.epoch += 1;
-    let epoch = scratch.epoch;
-    scratch.pairs.clear();
-    for &doc_id in block.iter() {
-        let posting = dataset.get(doc_id as u64);
-        let components = posting.components();
-        let values = posting.values();
-        for (&c, &v) in components.iter().zip(values) {
-            let v = v.to_f32().unwrap();
-            let idx: usize = c.as_();
-            if scratch.stamps[idx] != epoch {
-                scratch.stamps[idx] = epoch;
-                scratch.slots[idx] = scratch.pairs.len() as u32;
-                scratch.pairs.push((c, v));
-            } else {
-                let slot = &mut scratch.pairs[scratch.slots[idx] as usize].1;
-                if v > *slot {
-                    *slot = v;
+    let SummaryScratch { table, pairs } = scratch;
+    pairs.clear();
+    match table {
+        ComponentSlots::Dense {
+            stamps,
+            slots,
+            epoch,
+        } => {
+            *epoch += 1;
+            let epoch = *epoch;
+            for &doc_id in block.iter() {
+                let posting = dataset.get(doc_id as u64);
+                let components = posting.components();
+                let values = posting.values();
+                for (&c, &v) in components.iter().zip(values) {
+                    let v = v.to_f32().unwrap();
+                    let idx: usize = c.as_();
+                    if stamps[idx] != epoch {
+                        stamps[idx] = epoch;
+                        slots[idx] = pairs.len() as u32;
+                        pairs.push((c, v));
+                    } else {
+                        let slot = &mut pairs[slots[idx] as usize].1;
+                        if v > *slot {
+                            *slot = v;
+                        }
+                    }
+                }
+            }
+        }
+        ComponentSlots::Sparse(map) => {
+            map.clear();
+            for &doc_id in block.iter() {
+                let posting = dataset.get(doc_id as u64);
+                let components = posting.components();
+                let values = posting.values();
+                for (&c, &v) in components.iter().zip(values) {
+                    let v = v.to_f32().unwrap();
+                    match map.entry(c) {
+                        Entry::Vacant(e) => {
+                            e.insert(pairs.len() as u32);
+                            pairs.push((c, v));
+                        }
+                        Entry::Occupied(e) => {
+                            let slot = &mut pairs[*e.get() as usize].1;
+                            if v > *slot {
+                                *slot = v;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -491,6 +562,60 @@ where
             packed_postings: packed_postings.into_boxed_slice(),
             block_offsets: block_offsets.into_boxed_slice(),
             summaries: QuantizedSummary::from(SparseDataset::from(summary)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vectorium::{PlainSparseDataset, PlainSparseDatasetGrowable, PlainSparseQuantizer};
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    // The dense and hash-based scratch variants must fill `pairs` identically:
+    // same first-touch order, same per-component maxima. Running several
+    // successive blocks through the same scratches exercises the epoch-bump
+    // reuse on one side and the `map.clear()` reuse on the other.
+    #[test]
+    fn test_summary_scratch_sparse_matches_dense() {
+        let dim = 30;
+        let n_docs = 64;
+        let mut state = 42u64;
+        let quantizer = PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim);
+        let mut growable = PlainSparseDatasetGrowable::new(quantizer);
+        for _ in 0..n_docs {
+            let mut components: Vec<u16> = (0..8)
+                .map(|_| (lcg(&mut state) % dim as u64) as u16)
+                .collect();
+            components.sort_unstable();
+            components.dedup();
+            // Quantized values so duplicate components across the block's
+            // docs actually collide and max-update.
+            let values: Vec<f32> = components
+                .iter()
+                .map(|_| 0.1 + (lcg(&mut state) % 5) as f32 * 0.2)
+                .collect();
+            growable.push(SparseVectorView::new(
+                components.as_slice(),
+                values.as_slice(),
+            ));
+        }
+        let dataset: PlainSparseDataset<u16, f32, DotProduct> = growable.into();
+
+        let mut dense = SummaryScratch::dense(dim);
+        let mut sparse = SummaryScratch::sparse();
+        let doc_ids: Vec<usize> = (0..n_docs).collect();
+        for block in doc_ids.chunks(7) {
+            accumulate_block_max(&mut dense, &dataset, block);
+            accumulate_block_max(&mut sparse, &dataset, block);
+            assert!(!dense.pairs.is_empty());
+            assert_eq!(dense.pairs, sparse.pairs);
         }
     }
 }

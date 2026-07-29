@@ -392,6 +392,7 @@ where
         drop(values);
 
         let n_docs = dataset.len();
+        //FIXME: arbitrary choice of n_chunks. On large collections, this may cause high memory pressure. 
         let n_chunks = 256.min(n_docs);
         let chunk_size = n_docs.div_ceil(n_chunks);
         let chunk_ranges: Vec<std::ops::Range<usize>> = (0..n_docs)
