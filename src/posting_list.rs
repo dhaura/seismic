@@ -16,54 +16,12 @@ use crate::utils::{
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-
 use num_traits::{AsPrimitive, ToPrimitive};
 use vectorium::dataset::ScoredRange;
 use vectorium::{
     ComponentType, DatasetGrowable, Distance, DotProduct, QueryEvaluator, SpaceUsage,
     SparseDataset, SparseDatasetGrowable, SparseVectorEncoder, SparseVectorView, VectorEncoder,
 };
-
-/// Per-phase CPU-time accumulators for [`PostingList::build`], summed across
-/// all rayon workers (so the totals exceed the wall-clock of the parallel loop
-/// by ~the parallelism factor — use them for the *relative* split, not as a
-/// wall-clock figure). Instrumentation only.
-#[derive(Default)]
-pub(crate) struct BuildTimings {
-    clustering_ns: AtomicU64,
-    summary_ns: AtomicU64,
-    packing_ns: AtomicU64,
-}
-
-impl BuildTimings {
-    #[inline]
-    fn add(counter: &AtomicU64, start: Instant) {
-        counter.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    /// Print the per-phase split alongside the measured wall-clock of the
-    /// parallel build loop.
-    pub fn report(&self, wall: Duration) {
-        let s = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e9;
-        let (c, m, p) = (
-            s(&self.clustering_ns),
-            s(&self.summary_ns),
-            s(&self.packing_ns),
-        );
-        let tot = c + m + p;
-        let pct = |x: f64| if tot > 0.0 { 100.0 * x / tot } else { 0.0 };
-        println!(
-            "  build-phase CPU-time (summed over workers; parallel-loop wall {:.0}s):",
-            wall.as_secs_f64()
-        );
-        println!("    clustering (kmeans): {:.0}s ({:.1}%)", c, pct(c));
-        println!("    summaries:           {:.0}s ({:.1}%)", m, pct(m));
-        println!("    packing:             {:.0}s ({:.1}%)", p, pct(p));
-        println!("    total CPU:           {:.0}s", tot);
-    }
-}
 
 /// Instead of storing doc_ids we store their offsets in the forward_index and the lengths of the vectors
 /// This allows us to save the random accesses that would be needed to access exactly these values from the
@@ -460,7 +418,6 @@ where
         dataset: &S,
         postings: &[(ValueFor<S>, usize)],
         config: &Configuration,
-        timings: &BuildTimings,
     ) -> Self
     where
         S: SeismicBuildDataset,
@@ -468,7 +425,6 @@ where
     {
         let mut posting_list: Vec<_> = postings.iter().map(|(_, docid)| *docid).collect();
 
-        let t_cluster = Instant::now();
         let block_offsets = match config.blocking {
             BlockingStrategy::FixedSize { block_size } => {
                 Self::fixed_size_blocking(&posting_list, block_size)
@@ -486,9 +442,7 @@ where
                 clustering_algorithm,
             ),
         };
-        BuildTimings::add(&timings.clustering_ns, t_cluster);
 
-        let t_summary = Instant::now();
         let quantizer = vectorium::PlainSparseQuantizer::<C, f32, vectorium::DotProduct>::new(
             dataset.input_dim(),
             dataset.input_dim(),
@@ -527,14 +481,11 @@ where
                 values.as_slice(),
             ));
         }
-        BuildTimings::add(&timings.summary_ns, t_summary);
 
-        let t_pack = Instant::now();
         let packed_postings: Vec<_> = posting_list
             .iter()
             .map(|&doc_id| PackedPostingBlock::pack(dataset.range_from_id(doc_id as u64)))
             .collect();
-        BuildTimings::add(&timings.packing_ns, t_pack);
 
         Self {
             packed_postings: packed_postings.into_boxed_slice(),

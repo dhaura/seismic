@@ -109,8 +109,8 @@ where
 /// allocation per component. Scores are converted to `f32` once at build time
 /// so the scoring loop reads 8-byte `(centroid_slot, score)` entries.
 pub(crate) struct FastInvertedIndex {
-    offsets: Vec<u32>,
-    postings: Vec<(u32, f32)>,
+    offsets: Box<[u32]>,
+    postings: Box<[(u32, f32)]>,
 }
 
 impl FastInvertedIndex {
@@ -146,7 +146,39 @@ impl FastInvertedIndex {
             }
         }
 
-        Self { offsets, postings }
+        Self {
+            offsets: offsets.into_boxed_slice(),
+            postings: postings.into_boxed_slice(),
+        }
+    }
+
+    /// Keep only the `max_list_len` postings with the largest scores in each
+    /// component's list, preserving the slot order of the survivors.
+    fn pruned(self, max_list_len: usize) -> Self {
+        let Self { offsets, postings } = self;
+        let dim = offsets.len() - 1;
+        let mut postings = postings.into_vec();
+        let mut new_offsets = vec![0_u32; dim + 1];
+        let mut write = 0_usize;
+        for c in 0..dim {
+            let start = offsets[c] as usize;
+            let end = offsets[c + 1] as usize;
+            let len = end - start;
+            if len > max_list_len {
+                let list = &mut postings[start..end];
+                list.select_nth_unstable_by(max_list_len - 1, |a, b| b.1.total_cmp(&a.1));
+                list[..max_list_len].sort_unstable_by_key(|&(slot, _)| slot);
+            }
+            let keep = len.min(max_list_len);
+            postings.copy_within(start..start + keep, write);
+            write += keep;
+            new_offsets[c + 1] = write as u32;
+        }
+        postings.truncate(write);
+        Self {
+            offsets: new_offsets.into_boxed_slice(),
+            postings: postings.into_boxed_slice(),
+        }
     }
 
     #[inline]
@@ -201,7 +233,7 @@ where
 /// The function uses a simple pruned inverted index to speed up the computation and computes the
 /// true dot product between the document and the centroids.
 /// The parameter `doc_cut` specifies how many components of the document vector to consider while computing the dot product.
-pub fn do_random_kmeans_on_docids_ii_approx_dot_product<S>(
+pub(crate) fn do_random_kmeans_on_docids_ii_approx_dot_product<S>(
     doc_ids: &[usize],
     n_clusters: usize,
     dataset: &S,
@@ -306,17 +338,15 @@ where
     final_assignments
 }
 
-fn compute_centroid_assignments_dot_product<A, T, S>(
+fn compute_centroid_assignments_dot_product<S>(
     doc_ids: &[usize],
-    inverted_index: &[A],
+    inverted_index: &FastInvertedIndex,
     dataset: &S,
     centroids: &[usize],
     to_avoid: &HashSet<usize>,
     doc_cut: usize,
 ) -> Vec<(usize, usize)>
 where
-    A: AsRef<[(T, usize)]>,
-    T: ValueType,
     S: SeismicBuildDataset,
     for<'a> <EncoderFor<S> as VectorEncoder>::EncodedVector<'a>: Send,
     for<'a> <EncoderFor<S> as VectorEncoder>::Evaluator<'a>:
@@ -353,7 +383,8 @@ where
             let mut max_centroid_id = centroids[0];
             let mut max_dot = 0.0_f32;
             for component_id in top_components {
-                for &(_score, centroid_id) in inverted_index[component_id.as_()].as_ref().iter() {
+                for &(centroid_slot, _score) in inverted_index.postings(component_id.as_()) {
+                    let centroid_id = centroids[centroid_slot as usize];
                     if !visited.insert(centroid_id) {
                         continue;
                     }
@@ -403,26 +434,8 @@ where
 
     let pruned_list_size = 5.max((doc_ids.len() as f32 * pruning_factor) as usize);
 
-    // Build an inverted index for the centroids
-    let mut inverted_index = vec![Vec::new(); dataset.input_dim()];
-
-    for &centroid_id in centroid_ids.iter() {
-        let posting = dataset.get(centroid_id as u64);
-        for (c, score) in iter_components_values(&posting) {
-            inverted_index[c.as_()].push((score, centroid_id));
-        }
-    }
-
-    let inverted_index = inverted_index
-        .into_iter()
-        .map(|list| {
-            list.into_iter()
-                .k_largest_by(pruned_list_size, |a, b| {
-                    a.0.to_f32().unwrap().total_cmp(&b.0.to_f32().unwrap())
-                })
-                .collect_vec()
-        })
-        .collect_vec();
+    // Build a pruned inverted index for the centroids
+    let inverted_index = FastInvertedIndex::new(dataset, &centroid_ids).pruned(pruned_list_size);
 
     let mut centroid_assignments = compute_centroid_assignments_dot_product(
         doc_ids,
@@ -638,6 +651,24 @@ mod tests {
                 fast.postings(c),
                 naive[c].as_slice(),
                 "mismatch at component {}",
+                c
+            );
+        }
+
+        // Pruning keeps, per component, the `max_list_len` largest-score
+        // postings in slot order. Random f32 scores make ties negligible, so
+        // the naive top-k below is unambiguous.
+        let max_list_len = 5;
+        let pruned = FastInvertedIndex::new(&dataset, &centroid_doc_ids).pruned(max_list_len);
+        for c in 0..dataset.input_dim() {
+            let mut expected = naive[c].clone();
+            expected.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            expected.truncate(max_list_len);
+            expected.sort_unstable_by_key(|&(slot, _)| slot);
+            assert_eq!(
+                pruned.postings(c),
+                expected.as_slice(),
+                "pruned mismatch at component {}",
                 c
             );
         }

@@ -383,7 +383,6 @@ where
             if bits >> 31 == 1 { !bits } else { bits | 0x8000_0000 }
         }
 
-        let t_selection = Instant::now();
         let mut keys: Vec<u32> = (0..dataset.len())
             .into_par_iter()
             .flat_map_iter(|doc_id| {
@@ -400,12 +399,7 @@ where
         let n_above = keys.partition_point(|&k| k > lambda_key);
         let tie_budget = tot_postings - n_above;
         drop(keys);
-        println!(
-            "  pruning breakdown: threshold selection: {:.1} secs",
-            t_selection.elapsed().as_secs_f64()
-        );
 
-        let t_distribute = Instant::now();
         let n_docs = dataset.len();
         let n_chunks = 256.min(n_docs);
         let chunk_size = n_docs.div_ceil(n_chunks);
@@ -482,10 +476,6 @@ where
                 list
             })
             .collect();
-        println!(
-            "  pruning breakdown: distribute: {:.1} secs",
-            t_distribute.elapsed().as_secs_f64()
-        );
 
         new_inverted_pairs
     }
@@ -779,7 +769,6 @@ where
 
         print!("Building summaries: ");
         let time = Instant::now();
-        let timings = crate::posting_list::BuildTimings::default();
         // Build summaries and blocks for each posting list. Lists are
         // dispatched longest-first (LPT): each list builds serially inside one
         // worker, so a long list picked up near the end of the loop would
@@ -795,7 +784,7 @@ where
             .map(|&component| {
                 (
                     component,
-                    PostingList::build(&dataset, &inverted_pairs[component], &config, &timings),
+                    PostingList::build(&dataset, &inverted_pairs[component], &config),
                 )
             })
             .collect();
@@ -804,7 +793,6 @@ where
 
         let elapsed = time.elapsed();
         println!("{} secs", elapsed.as_secs());
-        timings.report(elapsed);
 
         if config.knn.nknn == 0 && config.knn.knn_path.is_none() {
             return Self {
