@@ -179,9 +179,9 @@ alpha =                 0.2                 # COI threshold parameter
 - `"random-kmeans-inverted-index-approx"`: Approximate version of above (faster)
 
 **Clustering-Specific Parameters:**
-- `kmeans-doc-cut`: Number of top document components to consider during clustering (for inverted-index variants)
+- `kmeans-doc-cut`: Number of top document components to consider during clustering (for `random-kmeans-inverted-index` and `random-kmeans-inverted-index-approx`)
 - `min-cluster-size`: Minimum size of clusters during k-means clustering. Clusters smaller than this are removed and their documents are reassigned to the nearest valid cluster. This helps eliminate noise and improves clustering quality
-- `kmeans-pruning-factor`: Pruning factor for inverted-index k-means variants
+- `kmeans-pruning-factor`: Pruning factor for `random-kmeans-inverted-index`
 
 **Pruning Strategy Options:**
 - `"global-threshold"`: Global threshold-based pruning (requires `max-fraction`)

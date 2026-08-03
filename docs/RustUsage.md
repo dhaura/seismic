@@ -29,8 +29,8 @@ Seismic has several parameters that control the space/time trade-offs when build
 - `--clustering-algorithm` selects the algorithm to cluster postings within each posting list. Options: `random-kmeans`, `random-kmeans-inverted-index`, `random-kmeans-inverted-index-approx`.
 - `--pruning-strategy` selects the posting list pruning strategy. Options: `global-threshold`, `coi-threshold`, `fixed-size`.
 - `-b, --block-size` block size used for fixed-size blocking (default: 10).
-- `--kmeans-doc-cut` number of top components retained while clustering (default: 15).
-- `--kmeans-pruning-factor` pruning factor used by the random k-means blocking (default: 0.005).
+- `--kmeans-doc-cut` number of top components retained while clustering (default: 15). Used by `random-kmeans-inverted-index` and `random-kmeans-inverted-index-approx`.
+- `--kmeans-pruning-factor` pruning factor used by the random k-means blocking (default: 0.005). Used by `random-kmeans-inverted-index` only.
 - `--min-cluster-size` minimum cluster size allowed (default: 2).
 - `-a, --alpha` fraction of L1 mass preserved by the COI pruning strategy (default: 0.15).
 - `-m, --max-fraction` maximum posting list length as a factor of `n_postings` (default: 1.5).

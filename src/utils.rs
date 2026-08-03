@@ -187,6 +187,47 @@ impl FastInvertedIndex {
     }
 }
 
+/// The dissolve pass every clustering driver runs between its two assignment
+/// passes: group a first-pass assignment by centroid, keep the clusters larger
+/// than `min_cluster_size`, and hand back the documents of the dissolved ones
+/// so the caller can reassign them.
+///
+/// Returns `(kept_assignments, to_be_reassigned, removed_centroids)`.
+/// `kept_assignments` is sorted, since `centroid_assignments` is sorted before
+/// grouping and the groups are emitted in order.
+fn dissolve_small_clusters(
+    mut centroid_assignments: Vec<(usize, usize)>,
+    n_docs: usize,
+    min_cluster_size: usize,
+) -> (Vec<(usize, usize)>, Vec<usize>, HashSet<usize>) {
+    let mut to_be_reassigned = Vec::new(); // docids that belong to too small clusters
+    let mut kept_assignments = Vec::with_capacity(n_docs);
+    let mut removed_centroids = HashSet::new();
+
+    centroid_assignments.sort_unstable();
+
+    for group in centroid_assignments.chunk_by(
+        // group by centroid_id
+        |&(centroid_id_a, _doc_id_a), &(centroid_id_b, _doc_id_b)| centroid_id_a == centroid_id_b,
+    ) {
+        let centroid_id = group[0].0;
+        if group.len() <= min_cluster_size {
+            to_be_reassigned.extend(group.iter().map(|(_centroid_id, doc_id)| doc_id));
+            removed_centroids.insert(centroid_id);
+        } else {
+            kept_assignments.extend(group.iter());
+        }
+    }
+
+    assert_eq!(
+        to_be_reassigned.len() + kept_assignments.len(),
+        n_docs,
+        "Final assignment size mismatch"
+    );
+
+    (kept_assignments, to_be_reassigned, removed_centroids)
+}
+
 fn compute_centroid_assignments_approx_dot_product<S>(
     doc_ids: &[usize],
     inverted_index: &FastInvertedIndex,
@@ -253,7 +294,7 @@ where
     // Build an inverted index for the centroids
     let inverted_index = FastInvertedIndex::new(dataset, &centroid_doc_ids);
 
-    let mut centroid_assignments = compute_centroid_assignments_approx_dot_product(
+    let centroid_assignments = compute_centroid_assignments_approx_dot_product(
         doc_ids,
         &inverted_index,
         dataset,
@@ -262,32 +303,8 @@ where
     );
 
     // Prune too small clusters and reassign the documents to the closest cluster
-    let mut to_be_reassigned = Vec::new(); // docids that belong to too small clusters
-    let mut final_assignments = Vec::with_capacity(doc_ids.len());
-    let mut removed_centroids = HashSet::new();
-
-    centroid_assignments.sort_unstable();
-
-    for group in centroid_assignments.chunk_by(
-        // group by centroid_id
-        |&(centroid_doc_id_a, _doc_id_a), &(centroid_doc_id_b, _doc_id_b)| {
-            centroid_doc_id_a == centroid_doc_id_b
-        },
-    ) {
-        let centroid_doc_id = group[0].0;
-        if group.len() <= min_cluster_size {
-            to_be_reassigned.extend(group.iter().map(|(_centroid_id, doc_id)| doc_id));
-            removed_centroids.insert(centroid_doc_id);
-        } else {
-            final_assignments.extend(group.iter());
-        }
-    }
-
-    assert_eq!(
-        to_be_reassigned.len() + final_assignments.len(),
-        doc_ids.len(),
-        "Final assignment size mismatch"
-    );
+    let (mut final_assignments, to_be_reassigned, removed_centroids) =
+        dissolve_small_clusters(centroid_assignments, doc_ids.len(), min_cluster_size);
 
     // The first pass dissolves the large majority of the clusters, so scoring
     // the reassigned documents against `inverted_index` would spend most of its
@@ -437,7 +454,7 @@ where
     // Build a pruned inverted index for the centroids
     let inverted_index = FastInvertedIndex::new(dataset, &centroid_ids).pruned(pruned_list_size);
 
-    let mut centroid_assignments = compute_centroid_assignments_dot_product(
+    let centroid_assignments = compute_centroid_assignments_dot_product(
         doc_ids,
         &inverted_index,
         dataset,
@@ -447,30 +464,8 @@ where
     );
 
     // Prune too small clusters and reassign the documents to the closest cluster
-    let mut to_be_reassigned = Vec::new(); // docids that belong to too small clusters
-    let mut final_assignments = Vec::with_capacity(doc_ids.len());
-    let mut removed_centroids = HashSet::new();
-
-    centroid_assignments.sort_unstable();
-
-    for group in centroid_assignments.chunk_by(
-        // group by centroid_id
-        |&(centroid_id_a, _doc_id_a), &(centroid_id_b, _doc_id_b)| centroid_id_a == centroid_id_b,
-    ) {
-        let centroid_id = group[0].0;
-        if group.len() <= min_cluster_size {
-            to_be_reassigned.extend(group.iter().map(|(_centroid_id, doc_id)| doc_id));
-            removed_centroids.insert(centroid_id);
-        } else {
-            final_assignments.extend(group.iter());
-        }
-    }
-
-    assert_eq!(
-        to_be_reassigned.len() + final_assignments.len(),
-        doc_ids.len(),
-        "Final assignment size mismatch"
-    );
+    let (mut final_assignments, to_be_reassigned, removed_centroids) =
+        dissolve_small_clusters(centroid_assignments, doc_ids.len(), min_cluster_size);
 
     let centroid_assignments = compute_centroid_assignments_dot_product(
         to_be_reassigned.as_slice(),
@@ -553,34 +548,12 @@ where
         .copied()
         .choose_multiple(&mut rng, n_clusters);
 
-    let mut centroid_assignments =
+    let centroid_assignments =
         compute_centroid_assignments(doc_ids, dataset, &centroid_ids, &HashSet::new());
 
     // Prune too small clusters and reassign the documents to the closest cluster
-    let mut to_be_reassigned = Vec::new(); // docids that belong to too small clusters
-    let mut final_assignments = Vec::with_capacity(doc_ids.len());
-    let mut removed_centroids = HashSet::new();
-
-    centroid_assignments.sort_unstable();
-
-    for group in centroid_assignments.chunk_by(
-        // group by centroid_id
-        |&(centroid_id_a, _doc_id_a), &(centroid_id_b, _doc_id_b)| centroid_id_a == centroid_id_b,
-    ) {
-        let centroid_id = group[0].0;
-        if group.len() <= min_cluster_size {
-            to_be_reassigned.extend(group.iter().map(|(_centroid_id, doc_id)| doc_id));
-            removed_centroids.insert(centroid_id);
-        } else {
-            final_assignments.extend(group.iter());
-        }
-    }
-
-    assert_eq!(
-        to_be_reassigned.len() + final_assignments.len(),
-        doc_ids.len(),
-        "Final assignment size mismatch"
-    );
+    let (mut final_assignments, to_be_reassigned, removed_centroids) =
+        dissolve_small_clusters(centroid_assignments, doc_ids.len(), min_cluster_size);
 
     let centroid_assignments = compute_centroid_assignments(
         to_be_reassigned.as_slice(),
